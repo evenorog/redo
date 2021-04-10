@@ -2,24 +2,28 @@
 name = "redo"
 version = "0.41.0"
 authors = ["evenorog <evenorog@gmail.com>"]
-description = "Provides advanced undo-redo functionality with static dispatch."
+description = "High-level undo-redo functionality."
 documentation = "https://docs.rs/redo"
 repository = "https://github.com/evenorog/redo"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 keywords = ["undo", "redo"]
-categories = ["data-structures", "rust-patterns", "no-std"]
+categories = ["data-structures", "rust-patterns"]
 exclude = ["/.travis.yml"]
 edition = "2018"
 
 [dependencies]
-chrono = { version = "0.4", optional = true, features = ["serde"] }
-colored = { version = "2", optional = true }
-serde = { version = "1", optional = true, default-features = false, features = ["alloc", "derive"] }
+undo = { version = "0.46", default-features = false }
+chrono_crate = { package = "chrono", version = "0.4", optional = true }
+serde_crate = { package = "serde", version = "1", optional = true, default-features = false, features = ["derive"] }
+
+[features]
+default = ["alloc"]
+alloc = ["undo/alloc", "serde_crate/alloc"]
+chrono = ["chrono_crate", "undo/chrono"]
+colored = ["undo/colored"]
+serde = ["serde_crate", "undo/serde", "chrono_crate/serde"]
 
 [badges]
 travis-ci = { repository = "evenorog/redo" }
 maintenance = { status = "actively-developed" }
-
-[package.metadata.docs.rs]
-features = ["chrono", "colored", "serde"]

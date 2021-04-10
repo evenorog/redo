@@ -1,206 +1,263 @@
-//! **Provides undo-redo functionality with static dispatch.**
-//!
-//! It is an implementation of the command pattern, where all modifications are done
-//! by creating objects of commands that applies the modifications. All commands knows
-//! how to undo the changes it applies, and by using the provided data structures
-//! it is easy to apply, undo, and redo changes made to a target.
-//!
-//! # Features
-//!
-//! * [Command](trait.Command.html) provides the base functionality for all commands.
-//! * [Record](struct.Record.html) provides basic linear undo-redo functionality.
-//! * [History](struct.History.html) provides non-linear undo-redo functionality that allows you to jump between different branches.
-//! * Queue wraps a record or history and extends them with queue functionality.
-//! * Checkpoint wraps a record or history and extends them with checkpoint functionality.
-//! * Commands can be merged into a single command by implementing the
-//!   [merge](trait.Command.html#method.merge) method on the command.
-//!   This allows smaller commands to be used to build more complex operations, or smaller incremental changes to be
-//!   merged into larger changes that can be undone and redone in a single step.
-//! * The target can be marked as being saved to disk and the data-structures can track the saved state and notify
-//!   when it changes.
-//! * The amount of changes being tracked can be configured by the user so only the `N` most recent changes are stored.
-//! * Configurable display formatting using the display structure.
-//! * The library can be used as `no_std` by default.
-//!
-//! # Cargo Feature Flags
-//!
-//! * `chrono`: Enables time stamps and time travel.
-//! * `serde`: Enables serialization and deserialization.
+//! **High-level undo-redo functionality.**
 
-#![no_std]
 #![doc(html_root_url = "https://docs.rs/redo")]
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
-extern crate alloc;
-
-mod format;
-pub mod history;
-pub mod record;
-
 #[cfg(feature = "chrono")]
-use chrono::{DateTime, Utc};
-use core::fmt;
+use chrono_crate::{DateTime, TimeZone};
 #[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
+use serde_crate::{Deserialize, Serialize};
+use undo::history::Builder as InnerBuilder;
+use undo::History as Inner;
+pub use undo::{Action, Merged, Result, Signal};
 
-pub use self::{history::History, record::Record};
-
-/// A specialized Result type for undo-redo operations.
-pub type Result<C> = core::result::Result<(), <C as Command>::Error>;
-
-/// Base functionality for all commands.
-pub trait Command: Sized {
-    /// The target type.
-    type Target;
-    /// The error type.
-    type Error;
-
-    /// Applies the command on the target and returns `Ok` if everything went fine,
-    /// and `Err` if something went wrong.
-    fn apply(&mut self, target: &mut Self::Target) -> Result<Self>;
-
-    /// Restores the state of the target as it was before the command was applied
-    /// and returns `Ok` if everything went fine, and `Err` if something went wrong.
-    fn undo(&mut self, target: &mut Self::Target) -> Result<Self>;
-
-    /// Reapplies the command on the target and return `Ok` if everything went fine,
-    /// and `Err` if something went wrong.
-    ///
-    /// The default implementation uses the [`apply`] implementation.
-    ///
-    /// [`apply`]: trait.Command.html#tymethod.apply
-    fn redo(&mut self, target: &mut Self::Target) -> Result<Self> {
-        self.apply(target)
-    }
-
-    /// Used for manual merging of commands.
-    fn merge(&mut self, command: Self) -> Merge<Self> {
-        Merge::No(command)
-    }
-}
-
-/// The signal used for communicating state changes.
+/// The target and the actions that has been applied to the target.
 ///
-/// For example, if the record can no longer redo any commands, it sends a `Redo(false)`
-/// signal to tell the user.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
-pub enum Signal {
-    /// Says if the structures can undo.
-    Undo(bool),
-    /// Says if the structures can redo.
-    Redo(bool),
-    /// Says if the target is in a saved state.
-    Saved(bool),
+/// # Examples
+/// ```
+/// # use redo::{Action, History};
+/// # struct Add(char);
+/// # impl From<char> for Add {
+/// #     fn from(c: char) -> Self { Add(c) }
+/// # }
+/// # impl Action for Add {
+/// #     type Target = String;
+/// #     type Output = ();
+/// #     type Error = &'static str;
+/// #     fn apply(&mut self, s: &mut String) -> redo::Result<Add> {
+/// #         s.push(self.0);
+/// #         Ok(())
+/// #     }
+/// #     fn undo(&mut self, s: &mut String) -> redo::Result<Add> {
+/// #         self.0 = s.pop().unwrap();
+/// #         Ok(())
+/// #     }
+/// # }
+/// # fn main() -> redo::Result<Add> {
+/// let mut history = History::<Add>::default();
+/// history.apply('a')?;
+/// history.apply('b')?;
+/// history.apply('c')?;
+/// assert_eq!(history.target(), "abc");
+/// history.undo().unwrap()?;
+/// history.undo().unwrap()?;
+/// history.undo().unwrap()?;
+/// assert_eq!(history.target(), "");
+/// history.redo().unwrap()?;
+/// history.redo().unwrap()?;
+/// history.redo().unwrap()?;
+/// assert_eq!(history.target(), "abc");
+/// # Ok(())
+/// # }
+/// ```
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(
+        crate = "serde_crate",
+        bound(
+            serialize = "A: Action + Serialize, A::Target: Serialize",
+            deserialize = "A: Action + Deserialize<'de>, A::Target: Deserialize<'de>"
+        )
+    )
+)]
+pub struct History<A: Action> {
+    inner: Inner<A>,
+    target: A::Target,
 }
 
-/// Says if the command have been merged with another command.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
-pub enum Merge<C> {
-    /// The commands have been merged.
-    Yes,
-    /// The commands have not been merged.
-    No(C),
-    /// The two commands cancels each other out.
-    Annul,
-}
-
-/// A position in a history tree.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Copy, Clone, Debug, Default, Hash, Eq, PartialEq)]
-struct At {
-    branch: usize,
-    current: usize,
-}
-
-impl At {
-    fn new(branch: usize, current: usize) -> At {
-        At { branch, current }
-    }
-}
-
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-struct Slot<F> {
-    #[cfg_attr(feature = "serde", serde(default = "Option::default", skip))]
-    f: Option<F>,
-}
-
-impl<F: FnMut(Signal)> Slot<F> {
-    fn emit(&mut self, signal: Signal) {
-        if let Some(ref mut f) = self.f {
-            f(signal);
+impl<A: Action> History<A> {
+    /// Returns a new history.
+    pub fn new(target: A::Target) -> History<A> {
+        History {
+            inner: Inner::new(),
+            target,
         }
     }
 
-    fn emit_if(&mut self, cond: bool, signal: Signal) {
-        if cond {
-            self.emit(signal)
-        }
+    /// Reserves capacity for at least `additional` more actions.
+    ///
+    /// # Panics
+    /// Panics if the new capacity overflows usize.
+    pub fn reserve(&mut self, additional: usize) {
+        self.inner.reserve(additional);
+    }
+
+    /// Returns the capacity of the history.
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    /// Shrinks the capacity of the history as much as possible.
+    pub fn shrink_to_fit(&mut self) {
+        self.inner.shrink_to_fit();
+    }
+
+    /// Returns the number of actions in the current branch of the history.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns `true` if the current branch of the history is empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Returns the limit of the history.
+    pub fn limit(&self) -> usize {
+        self.inner.limit()
+    }
+
+    /// Sets how the signal should be handled when the state changes.
+    ///
+    /// The previous slot is returned if it exists.
+    pub fn connect(&mut self, slot: impl FnMut(Signal) + 'static) -> Option<impl FnMut(Signal)> {
+        self.inner.connect(Box::new(slot))
+    }
+
+    /// Removes and returns the slot if it exists.
+    pub fn disconnect(&mut self) -> Option<impl FnMut(Signal)> {
+        self.inner.disconnect()
+    }
+
+    /// Returns `true` if the target is in a saved state, `false` otherwise.
+    pub fn is_saved(&self) -> bool {
+        self.inner.is_saved()
+    }
+
+    /// Returns `true` if the history can undo.
+    pub fn can_undo(&self) -> bool {
+        self.inner.can_undo()
+    }
+
+    /// Returns `true` if the history can redo.
+    pub fn can_redo(&self) -> bool {
+        self.inner.can_redo()
+    }
+
+    /// Returns the position of the current action.
+    pub fn current(&self) -> usize {
+        self.inner.current()
+    }
+
+    /// Pushes the action to the top of the history and executes its `apply`method.
+    ///
+    /// # Errors
+    /// If an error occur when executing `apply` the error is returned.
+    pub fn apply(&mut self, actions: impl Into<A>) -> Result<A> {
+        self.inner.apply(&mut self.target, actions.into())
+    }
+
+    /// Calls the `undo` method for the active action
+    /// and sets the previous one as the new active one.
+    ///
+    /// # Errors
+    /// If an error occur when executing `undo` the error is returned.
+    pub fn undo(&mut self) -> Option<Result<A>> {
+        self.inner.undo(&mut self.target)
+    }
+
+    /// Calls the `redo` method for the active action
+    /// and sets the next one as the new active one.
+    ///
+    /// # Errors
+    /// If an error occur when executing `redo` the error is returned.
+    pub fn redo(&mut self) -> Option<Result<A>> {
+        self.inner.redo(&mut self.target)
+    }
+
+    /// Marks the target as currently being in a saved or unsaved state.
+    pub fn set_saved(&mut self, saved: bool) {
+        self.inner.set_saved(saved);
+    }
+
+    /// Removes all actions from the history without undoing them.
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    /// Returns a reference to the target.
+    pub fn target(&self) -> &A::Target {
+        &self.target
+    }
+
+    /// Returns a mutable reference to the target.
+    pub fn target_mut(&mut self) -> &mut A::Target {
+        &mut self.target
+    }
+
+    /// Consumes the history and returns the target.
+    pub fn into_target(self) -> A::Target {
+        self.target
     }
 }
 
-impl<F> Default for Slot<F> {
-    fn default() -> Self {
-        Slot { f: None }
+impl<A: Action<Output = ()>> History<A> {
+    /// Repeatedly calls `undo` or`redo` until the action in `branch` at `current` is reached.
+    ///
+    /// # Errors
+    /// If an error occur when executing `undo` or `redo` the error is returned.
+    pub fn go_to(&mut self, branch: usize, current: usize) -> Option<Result<A>> {
+        self.inner.go_to(&mut self.target, branch, current)
     }
-}
 
-impl<F> fmt::Debug for Slot<F> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.f {
-            Some(_) => f.pad("Slot { .. }"),
-            None => f.pad("Empty"),
-        }
-    }
-}
-
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
-struct Entry<C> {
-    command: C,
+    /// Go back or forward in the history to the action that was made closest to the datetime provided.
+    ///
+    /// This method does not jump across branches.
     #[cfg(feature = "chrono")]
-    timestamp: DateTime<Utc>,
+    pub fn time_travel(&mut self, to: &DateTime<impl TimeZone>) -> Option<Result<A>> {
+        self.inner.time_travel(&mut self.target, to)
+    }
 }
 
-impl<C> From<C> for Entry<C> {
-    fn from(command: C) -> Self {
-        Entry {
-            command,
-            #[cfg(feature = "chrono")]
-            timestamp: Utc::now(),
+impl<A: Action> Default for History<A>
+where
+    A::Target: Default,
+{
+    fn default() -> Self {
+        History::new(A::Target::default())
+    }
+}
+
+/// Builder for a history.
+pub struct Builder(InnerBuilder);
+
+impl Builder {
+    /// Returns a builder for a history.
+    pub fn new() -> Builder {
+        Builder(InnerBuilder::new())
+    }
+
+    /// Sets the capacity for the history.
+    pub fn capacity(self, capacity: usize) -> Builder {
+        Builder(self.0.capacity(capacity))
+    }
+
+    /// Connects the slot.
+    pub fn connect(self, f: impl FnMut(Signal) + 'static) -> Builder {
+        Builder(self.0.connect(Box::new(f)))
+    }
+
+    /// Sets the `limit` for the history.
+    ///
+    /// # Panics
+    /// Panics if `limit` is `0`.
+    pub fn limit(self, limit: usize) -> Builder {
+        Builder(self.0.limit(limit))
+    }
+
+    /// Sets if the target is initially in a saved state.
+    /// By default the target is in a saved state.
+    pub fn saved(self, saved: bool) -> Builder {
+        Builder(self.0.saved(saved))
+    }
+
+    /// Builds the history.
+    pub fn build<A: Action>(self, target: A::Target) -> History<A> {
+        History {
+            inner: self.0.build(),
+            target,
         }
-    }
-}
-
-impl<C: Command> Command for Entry<C> {
-    type Target = C::Target;
-    type Error = C::Error;
-
-    fn apply(&mut self, target: &mut Self::Target) -> Result<Self> {
-        self.command.apply(target)
-    }
-
-    fn undo(&mut self, target: &mut Self::Target) -> Result<Self> {
-        self.command.undo(target)
-    }
-
-    fn redo(&mut self, target: &mut Self::Target) -> Result<Self> {
-        self.command.redo(target)
-    }
-
-    fn merge(&mut self, command: Self) -> Merge<Self> {
-        match self.command.merge(command.command) {
-            Merge::Yes => Merge::Yes,
-            Merge::No(command) => Merge::No(Entry::from(command)),
-            Merge::Annul => Merge::Annul,
-        }
-    }
-}
-
-impl<C: fmt::Display> fmt::Display for Entry<C> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        (&self.command as &dyn fmt::Display).fmt(f)
     }
 }
